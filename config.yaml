@@ -1,0 +1,92 @@
+# 证书, 亦可不提供使用默认的, 自己提供也行
+cert: xx.crt
+key: xx.key
+domain: xxxx.xxx
+
+servers:
+
+# ltc
+  - name: LTC-鱼池-tcp    # tcp
+    port:  40220     #
+    is_ssl: false             #
+    coin: LTC            # 币种, 参数上面完成的
+    pool: # 实际代理矿池
+      host: ltc.f2pool.com:3335
+
+  - name: LTC-鱼池-SSL    # is_ssl 及 解密
+    port:  50220     #
+    is_ssl: true             #
+    coin: LTC            # 币种, 参数上面完成的
+    pool: # 实际代理矿池
+      host: ltc.f2pool.com:3335
+
+  - name: LTC-蚂蚁-tcp    # tcp
+    port:  40230     #
+    is_ssl: false             #
+    coin: LTC            # 币种, 参数上面完成的
+    pool: # 实际代理矿池
+      host: stratum-ltc.antpool.com:443
+
+  - name: LTC-蚂蚁-SSL    # is_ssl 及 解密
+    port:  50230     #
+    is_ssl: true             #
+    coin: LTC            # 币种, 参数上面完成的
+    pool: # 实际代理矿池
+      host: stratum-ltc.antpool.com:443
+
+  - name: LTC-viabtc-tcp    # tcp
+    port:  40240     #
+    is_ssl: false             #
+    coin: LTC            # 币种, 参数上面完成的
+    pool: # 实际代理矿池
+      host: ltc.viabtc.io:3333
+
+  - name: LTC-viabtc-SSL    # is_ssl 及 解密
+    port:  50240     #
+    is_ssl: true             #
+    coin: LTC            # 币种, 参数上面完成的
+    pool: # 实际代理矿池
+      host: ltc.viabtc.io:3333
+
+# btc
+  - name: BTC-鱼池-tcp    # tcp
+    port:  40200     #
+    is_ssl: false             #
+    coin: btc            # 币种, 参数上面完成的
+    pool: # 实际代理矿池
+      host: btc-asia.f2pool.com:1314
+
+  - name: BTC-鱼池-SSL    #
+    port:  50200     #
+    is_ssl: true             #
+    coin: BTC            # 币种, 参数上面完成的
+    pool: # 实际代理矿池
+      host: btc-asia.f2pool.com:1314
+
+  - name: BTC-viabtc-tcp    # tcp
+    port:  40201     #
+    is_ssl: false             #
+    coin: btc            # 币种, 参数上面完成的
+    pool: # 实际代理矿池
+      host: btc.viabtc.io:3333
+
+  - name: BTC-viabtc-SSL    # is_ssl 及 解密
+    port:  50201     #
+    is_ssl: true             #
+    coin: BTC            # 币种, 参数上面完成的
+    pool: # 实际代理矿池
+      host: btc.viabtc.io:3333
+
+  - name: BTC-蚂蚁-tcp    # tcp
+    port:  40202     #
+    is_ssl: false             #
+    coin: btc            # 币种, 参数上面完成的
+    pool: # 实际代理矿池
+      host:  ss.antpool.com:443
+
+  - name: BTC-蚂蚁-SSL    # is_ssl 及 解密
+    port:  50202     #
+    is_ssl: true             #
+    coin: BTC            # 币种, 参数上面完成的
+    pool: # 实际代理矿池
+      host:  ss.antpool.com:443

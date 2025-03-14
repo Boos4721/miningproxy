@@ -42,10 +42,43 @@ jobs:
         name: binaries
         path: build/
 
+  auto_tag:
+    name: Auto Tag
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master' && !startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Get latest tag
+      id: latest_tag
+      run: |
+        latest_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+        echo "LATEST_TAG=$latest_tag" >> $GITHUB_ENV
+        
+    - name: Generate new tag
+      id: new_tag
+      run: |
+        latest_ver=${LATEST_TAG#v}
+        IFS='.' read -r major minor patch <<< "$latest_ver"
+        new_patch=$((patch + 1))
+        new_tag="v$major.$minor.$new_patch"
+        echo "NEW_TAG=$new_tag" >> $GITHUB_ENV
+        
+    - name: Create and push new tag
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git tag -a $NEW_TAG -m "Release $NEW_TAG"
+        git push origin $NEW_TAG
+
   release:
     name: Create Release
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build, auto_tag]
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'push' && github.ref == 'refs/heads/master')
     runs-on: ubuntu-latest
     steps:
     - name: Download build artifacts
@@ -62,6 +95,7 @@ jobs:
     - name: Create release
       uses: softprops/action-gh-release@v1
       with:
+        tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || env.NEW_TAG }}
         files: |
           build/*
         generate_release_notes: true 

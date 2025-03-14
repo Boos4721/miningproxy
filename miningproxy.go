@@ -191,16 +191,9 @@ func startServer(server Server, cert tls.Certificate) {
 	config := &net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
 			return c.Control(func(fd uintptr) {
-				// 禁用Nagle算法
-				syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
-
-				// 设置更大的接收缓冲区
-				syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4*1024*1024)
-
-				// 设置更大的发送缓冲区
-				syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, 4*1024*1024)
-
-				// 注：去除了TCP_FASTOPEN设置，因为它不是所有平台都支持
+				if err := setTCPSocketOptions(fd); err != nil {
+					log.Printf("设置套接字选项失败: %v", err)
+				}
 			})
 		},
 	}

@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -43,10 +41,18 @@ type Pool struct {
 
 // 连接统计
 type Stats struct {
-	activeConnections int64
-	totalConnections  int64
-	bytesIn           int64
-	bytesOut          int64
+	activeConnections   int64
+	totalConnections    int64
+	acceptedShares      int64
+	rejectedShares      int64
+	invalidShares       int64
+	networkErrors       int64
+	lastConnectionTime  time.Time
+	bytesReceived       int64
+	bytesSent           int64
+	startTime           time.Time
+	lastShareSubmitTime time.Time
+	mutex               sync.RWMutex
 }
 
 // Stratum协议相关结构
@@ -140,8 +146,8 @@ func reportStats() {
 		for name, s := range stats {
 			active := atomic.LoadInt64(&s.activeConnections)
 			total := atomic.LoadInt64(&s.totalConnections)
-			in := atomic.LoadInt64(&s.bytesIn)
-			out := atomic.LoadInt64(&s.bytesOut)
+			in := atomic.LoadInt64(&s.bytesReceived)
+			out := atomic.LoadInt64(&s.bytesSent)
 
 			fmt.Printf("%s: 活跃连接: %d, 总连接: %d, 流入: %s, 流出: %s\n",
 				name, active, total, formatBytes(in), formatBytes(out))
@@ -180,6 +186,42 @@ func printPoolInfo(servers []Server, domain string) {
 
 		// 按照用户要求的格式输出
 		fmt.Printf("%s %s | 矿池地址 | %s\n", server.Name, server.Coin, poolAddress)
+	}
+}
+
+// 修改打印统计信息的代码，只显示活跃连接
+func printStats() {
+	statsMux.RLock()
+	defer statsMux.RUnlock()
+
+	fmt.Println("=== 服务器统计信息 ===")
+	activeServerFound := false
+
+	for name, s := range stats {
+		active := atomic.LoadInt64(&s.activeConnections)
+
+		// 只显示有活跃连接的服务器
+		if active > 0 {
+			activeServerFound = true
+			fmt.Printf("%s: 活跃连接: %d, 总连接: %d, 流入: %s, 流出: %s\n",
+				name,
+				active,
+				atomic.LoadInt64(&s.totalConnections),
+				formatBytes(atomic.LoadInt64(&s.bytesReceived)),
+				formatBytes(atomic.LoadInt64(&s.bytesSent)))
+		}
+	}
+
+	if !activeServerFound {
+		fmt.Println("当前没有活跃连接")
+	}
+}
+
+// 修改连接关闭的日志记录代码
+func logConnectionClosed(serverName string, workerName string) {
+	// 只记录已识别的worker连接关闭
+	if workerName != "" && workerName != "未识别" {
+		log.Printf("连接已关闭 - %s - Worker: %s", serverName, workerName)
 	}
 }
 
@@ -282,22 +324,28 @@ func startServer(server Server, cert tls.Certificate) {
 	}
 }
 
-// 改进handleConnection函数，优化数据传输
+// 修改handleConnection函数，完全移除worker识别和连接关闭日志
 func handleConnection(clientConn net.Conn, server Server, serverStats *Stats) {
+	var poolConn net.Conn
+
 	defer func() {
 		clientConn.Close()
+		if poolConn != nil {
+			poolConn.Close()
+		}
 		atomic.AddInt64(&serverStats.activeConnections, -1)
+		// 不再记录连接关闭日志
 	}()
 
-	// 设置客户端连接超时
-	clientConn.SetDeadline(time.Now().Add(10 * time.Second))
-
-	// 使用多个并发连接到矿池以提高性能
-	poolConn, err := net.DialTimeout("tcp", server.Pool.Host, 5*time.Second)
+	// 连接到上游矿池
+	var err error
+	poolConn, err = net.Dial("tcp", server.Pool.Host)
 	if err != nil {
+		// 只记录连接失败，不记录worker信息
+		log.Printf("连接上游矿池失败: %v", err)
+		atomic.AddInt64(&serverStats.networkErrors, 1)
 		return
 	}
-	defer poolConn.Close()
 
 	// 设置矿池连接的TCP选项
 	if tcpConn, ok := poolConn.(*net.TCPConn); ok {
@@ -308,122 +356,35 @@ func handleConnection(clientConn net.Conn, server Server, serverStats *Stats) {
 		tcpConn.SetWriteBuffer(128 * 1024) // 增加写缓冲区
 	}
 
-	// 设置矿池连接超时
-	poolConn.SetDeadline(time.Now().Add(10 * time.Second))
-
-	// 双向复制数据
+	// 数据转发部分不变
 	var wg sync.WaitGroup
 	wg.Add(2)
-
-	// 用于识别worker的变量
-	var workerName string
-	var workerIdentified bool
-	workerMutex := &sync.Mutex{}
 
 	// 客户端 -> 矿池
 	go func() {
 		defer wg.Done()
-
-		// 创建一个带缓冲的读取器
-		reader := bufio.NewReaderSize(clientConn, 32*1024) // 增加到32K
-
-		for {
-			// 扩展读取超时
-			clientConn.SetDeadline(time.Now().Add(120 * time.Second))
-
-			// 读取一行数据
-			line, err := reader.ReadBytes('\n')
-			if err != nil {
-				if err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
-					// 只处理非EOF非关闭连接错误
-				}
-				break
-			}
-
-			// 更新读取的字节数
-			atomic.AddInt64(&serverStats.bytesIn, int64(len(line)))
-
-			// worker识别逻辑
-			if !workerIdentified {
-				if bytes.Contains(line, []byte("mining.authorize")) ||
-					bytes.Contains(line, []byte("mining.subscribe")) {
-					var request StratumRequest
-					if err := json.Unmarshal(line, &request); err == nil {
-						if (request.Method == "mining.authorize" || request.Method == "mining.subscribe") && len(request.Params) > 0 {
-							if workerStr, ok := request.Params[0].(string); ok {
-								workerMutex.Lock()
-								workerName = workerStr
-								workerIdentified = true
-								workerMutex.Unlock()
-							}
-						}
-					}
-				}
-			}
-
-			// 扩展写入超时
-			poolConn.SetDeadline(time.Now().Add(5 * time.Second))
-
-			// 将数据转发到矿池
-			_, err = poolConn.Write(line)
-			if err != nil {
-				break
-			}
+		n, err := io.Copy(poolConn, clientConn)
+		if err != nil && err != io.EOF {
+			// 只记录错误，不提及worker
+			log.Printf("转发客户端数据到矿池失败: %v", err)
 		}
-
-		// 当客户端断开时，关闭矿池连接的写入端
-		if conn, ok := poolConn.(*net.TCPConn); ok {
-			conn.CloseWrite()
-		}
+		atomic.AddInt64(&serverStats.bytesReceived, n)
+		poolConn.(*net.TCPConn).CloseWrite()
 	}()
 
-	// 矿池 -> 客户端，使用更大的缓冲区
+	// 矿池 -> 客户端
 	go func() {
 		defer wg.Done()
-
-		// 从池中获取缓冲区
-		buffer := bufferPool.Get().([]byte)
-		defer bufferPool.Put(buffer)
-
-		for {
-			// 扩展读取超时
-			poolConn.SetDeadline(time.Now().Add(120 * time.Second))
-
-			n, err := poolConn.Read(buffer)
-			if err != nil {
-				break
-			}
-
-			// 更新读取的字节数
-			atomic.AddInt64(&serverStats.bytesOut, int64(n))
-
-			// 扩展写入超时
-			clientConn.SetDeadline(time.Now().Add(5 * time.Second))
-
-			_, err = clientConn.Write(buffer[:n])
-			if err != nil {
-				break
-			}
+		n, err := io.Copy(clientConn, poolConn)
+		if err != nil && err != io.EOF {
+			// 只记录错误，不提及worker
+			log.Printf("转发矿池数据到客户端失败: %v", err)
 		}
-
-		// 当矿池断开时，关闭客户端连接的写入端
-		if conn, ok := clientConn.(*net.TCPConn); ok {
-			conn.CloseWrite()
-		}
+		atomic.AddInt64(&serverStats.bytesSent, n)
+		clientConn.(*net.TCPConn).CloseWrite()
 	}()
 
-	// 等待两个方向的数据传输完成
 	wg.Wait()
-
-	workerMutex.Lock()
-	workerInfo := workerName
-	workerMutex.Unlock()
-
-	if workerInfo != "" {
-		log.Printf("连接已关闭 - %s - Worker: %s", server.Name, workerInfo)
-	} else {
-		log.Printf("连接已关闭 - %s - Worker: 未识别", server.Name)
-	}
 }
 
 // 从证书路径中提取域名

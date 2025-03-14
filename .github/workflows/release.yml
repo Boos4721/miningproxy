@@ -1,0 +1,92 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.20'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y upx-ucl zip
+          go mod tidy
+
+      - name: Get release version
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+
+      - name: Build binaries
+        run: |
+          # 创建构建目录
+          mkdir -p build
+          
+          # 编译Linux版本
+          GOOS=linux GOARCH=amd64 go build -o build/miningproxy_linux_amd64 -ldflags="-s -w"
+          GOOS=linux GOARCH=arm64 go build -o build/miningproxy_linux_arm64 -ldflags="-s -w"
+          
+          # 编译Windows版本
+          GOOS=windows GOARCH=amd64 go build -o build/miningproxy_windows_amd64.exe -ldflags="-s -w"
+          
+          # 编译macOS版本
+          GOOS=darwin GOARCH=amd64 go build -o build/miningproxy_darwin_amd64 -ldflags="-s -w"
+          GOOS=darwin GOARCH=arm64 go build -o build/miningproxy_darwin_arm64 -ldflags="-s -w"
+          
+          # 压缩二进制文件
+          upx --best --lzma build/miningproxy_linux_amd64
+          upx --best --lzma build/miningproxy_linux_arm64
+          upx --best --lzma build/miningproxy_windows_amd64.exe
+          upx --best --lzma build/miningproxy_darwin_amd64
+          upx --best --lzma build/miningproxy_darwin_arm64
+          
+          # 创建发布包
+          cp cert-manager.sh build/
+          cp cert-manager.bat build/
+          cp LICENSE build/ || echo "LICENSE file not found"
+          cp README.md build/ || echo "README.md file not found"
+          cp config.yaml.example build/ || echo "Config example not found"
+          
+          # 创建zip包
+          cd build
+          zip -r "miningproxy_${VERSION}_linux_amd64.zip" miningproxy_linux_amd64 cert-manager.sh LICENSE README.md config.yaml.example
+          zip -r "miningproxy_${VERSION}_linux_arm64.zip" miningproxy_linux_arm64 cert-manager.sh LICENSE README.md config.yaml.example
+          zip -r "miningproxy_${VERSION}_windows_amd64.zip" miningproxy_windows_amd64.exe cert-manager.bat LICENSE README.md config.yaml.example
+          zip -r "miningproxy_${VERSION}_macos_amd64.zip" miningproxy_darwin_amd64 cert-manager.sh LICENSE README.md config.yaml.example
+          zip -r "miningproxy_${VERSION}_macos_arm64.zip" miningproxy_darwin_arm64 cert-manager.sh LICENSE README.md config.yaml.example
+      
+      - name: List files
+        run: ls -la build/
+        
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            build/*.zip
+            build/miningproxy_linux_amd64
+            build/miningproxy_linux_arm64
+            build/miningproxy_windows_amd64.exe
+            build/miningproxy_darwin_amd64
+            build/miningproxy_darwin_arm64
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 

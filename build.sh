@@ -1,84 +1,48 @@
 #!/bin/bash
 
-# 多平台编译脚本
-# 支持Linux/Windows/macOS/ARM架构
-
-# 设置输出目录
-OUTPUT_DIR="build"
-# 程序名称
-APP_NAME="miningproxy"
-# 版本号
 VERSION="1.0.0"
+BINARY_NAME="miningproxy"
+BUILD_DIR="build"
 
-# 创建输出目录
-mkdir -p $OUTPUT_DIR
+echo "=== 开始编译 ${BINARY_NAME} v${VERSION} ==="
 
-echo "=== 开始编译 $APP_NAME v$VERSION ==="
+# 创建构建目录
+mkdir -p ${BUILD_DIR}
 
-# 编译优化标志
-LDFLAGS="-s -w" # 减小二进制文件体积
-
-# 定义目标平台
-PLATFORMS=(
-    "linux/amd64"
-    "linux/arm64"
-    "linux/arm/v7"
-    "windows/amd64"
-    "windows/386"
-    "darwin/amd64"
-    "darwin/arm64"
-    "freebsd/amd64"
-)
-
-# 编译所有平台
-for PLATFORM in "${PLATFORMS[@]}"; do
-    OS=${PLATFORM%/*}
-    ARCH=${PLATFORM#*/}
+# 编译函数
+build() {
+    local os=$1
+    local arch=$2
+    local output=$3
     
-    # 处理ARM版本
-    if [[ "$ARCH" == "arm/v7" ]]; then
-        GOARM=7
-        ARCH="arm"
-    else
-        GOARM=""
-    fi
-    
-    # 设置二进制文件名
-    if [[ "$OS" == "windows" ]]; then
-        BIN_NAME="${APP_NAME}_${OS}_${ARCH}.exe"
-    else
-        BIN_NAME="${APP_NAME}_${OS}_${ARCH}"
-    fi
-    
-    OUTPUT_PATH="$OUTPUT_DIR/$BIN_NAME"
-    
-    echo "正在编译: $OS/$ARCH -> $OUTPUT_PATH"
-    
-    # 设置环境变量并编译
-    if [[ "$GOARM" != "" ]]; then
-        GOOS=$OS GOARCH=$ARCH GOARM=$GOARM go build -ldflags="-s -w" -o $OUTPUT_PATH
-    else
-        GOOS=$OS GOARCH=$ARCH go build -ldflags="-s -w" -o $OUTPUT_PATH
-    fi
+    echo "正在编译: ${os}/${arch} -> ${BUILD_DIR}/${output}"
+    GOOS=${os} GOARCH=${arch} go build -ldflags="-s -w" -o ${BUILD_DIR}/${output} .
     
     if [ $? -ne 0 ]; then
-        echo "编译失败: $OS/$ARCH"
-    else
-        # 在非Windows平台上添加执行权限
-        if [[ "$OS" != "windows" ]]; then
-            chmod +x $OUTPUT_PATH
-        fi
-        
-        # 对Linux和macOS二进制文件进行压缩
-        if [[ "$OS" == "linux" || "$OS" == "darwin" ]] && command -v upx &> /dev/null; then
-            echo "压缩二进制文件: $OUTPUT_PATH"
-            upx -9 $OUTPUT_PATH
-        fi
-        
-        echo "编译成功: $BIN_NAME"
+        echo "编译失败: ${os}/${arch}"
+        return 1
     fi
-done
+    
+    # 对非macOS平台使用UPX压缩
+    if [[ $os != "darwin" ]]; then
+        echo "压缩二进制文件: ${BUILD_DIR}/${output}"
+        upx --best ${BUILD_DIR}/${output} || true
+    fi
+    
+    echo "编译成功: ${output}"
+    return 0
+}
+
+# 各平台编译
+build linux amd64 ${BINARY_NAME}_linux_amd64
+build linux arm64 ${BINARY_NAME}_linux_arm64
+build linux arm ${BINARY_NAME}_linux_arm  # 修正: 从 linux/arm/arm 改为 linux/arm
+build windows amd64 ${BINARY_NAME}_windows_amd64.exe
+build windows 386 ${BINARY_NAME}_windows_386.exe
+build darwin amd64 ${BINARY_NAME}_darwin_amd64
+build darwin arm64 ${BINARY_NAME}_darwin_arm64
+build freebsd amd64 ${BINARY_NAME}_freebsd_amd64
 
 echo "=== 编译完成 ==="
-echo "编译结果保存在: $(pwd)/$OUTPUT_DIR/"
-# ls -la $OUTPUT_DIR/ 
+echo "编译结果保存在: $(pwd)/${BUILD_DIR}/"
+ls -la ${BUILD_DIR}

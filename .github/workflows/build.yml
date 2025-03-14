@@ -24,6 +24,9 @@ jobs:
       run: |
         sed -i 's/go 1.24.1/go 1.20/' go.mod
 
+    - name: Install UPX
+      run: sudo apt-get update && sudo apt-get install -y upx-ucl
+
     - name: Manage dependencies
       run: go mod tidy
 

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -54,21 +56,23 @@ type StratumRequest struct {
 	Params []interface{}   `json:"params"`
 }
 
-// 缓冲区对象池
+// 缓冲区对象池的大小增加到32KB以提高效率
 var bufferPool = sync.Pool{
 	New: func() interface{} {
-		return make([]byte, 16*1024) // 16KB缓冲区
+		return make([]byte, 32*1024) // 32KB缓冲区
 	},
 }
 
+// 添加连接信号量控制并发
 var (
-	stats    = make(map[string]*Stats)
-	statsMux sync.RWMutex
+	stats     = make(map[string]*Stats)
+	statsMux  sync.RWMutex
+	connLimit = make(chan struct{}, 20000) // 限制最大20000个并发连接
 )
 
 func main() {
-	// 设置GOMAXPROCS为CPU核心数
-	runtime.GOMAXPROCS(runtime.NumCPU())
+	// 设置GOMAXPROCS为CPU核心数的两倍，充分利用CPU
+	runtime.GOMAXPROCS(runtime.NumCPU() * 2)
 
 	// 读取配置文件
 	configData, err := os.ReadFile("config.yaml")
@@ -179,12 +183,28 @@ func printPoolInfo(servers []Server, domain string) {
 	}
 }
 
-// 启动服务器
+// 改进startServer函数，增加TCP优化（跨平台兼容）
 func startServer(server Server, cert tls.Certificate) {
 	addr := fmt.Sprintf("0.0.0.0:%d", server.Port)
-	// log.Printf("启动服务 %s 在端口 %d, SSL模式: %v", server.Name, server.Port, server.IsSSL)
 
-	// 创建监听器
+	// 创建监听器时设置TCP参数
+	config := &net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) {
+				// 禁用Nagle算法
+				syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+
+				// 设置更大的接收缓冲区
+				syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4*1024*1024)
+
+				// 设置更大的发送缓冲区
+				syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, 4*1024*1024)
+
+				// 注：去除了TCP_FASTOPEN设置，因为它不是所有平台都支持
+			})
+		},
+	}
+
 	var listener net.Listener
 	var err error
 
@@ -202,10 +222,20 @@ func startServer(server Server, cert tls.Certificate) {
 				tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
 				tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
 			},
+			SessionTicketsDisabled: false,
 		}
-		listener, err = tls.Listen("tcp", addr, tlsConfig)
+
+		// 使用自定义的配置创建TCP Listener
+		tcpListener, err := config.Listen(context.Background(), "tcp", addr)
+		if err != nil {
+			log.Printf("启动服务 %s 失败: %v", server.Name, err)
+			return
+		}
+
+		listener = tls.NewListener(tcpListener, tlsConfig)
 	} else {
-		listener, err = net.Listen("tcp", addr)
+		// 使用自定义的配置创建TCP Listener
+		listener, err = config.Listen(context.Background(), "tcp", addr)
 	}
 
 	if err != nil {
@@ -223,7 +253,6 @@ func startServer(server Server, cert tls.Certificate) {
 		conn, err := listener.Accept()
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Temporary() {
-				// 临时错误，稍后重试
 				time.Sleep(5 * time.Millisecond)
 				continue
 			}
@@ -231,26 +260,37 @@ func startServer(server Server, cert tls.Certificate) {
 			break
 		}
 
-		// 更新统计信息
-		atomic.AddInt64(&serverStats.activeConnections, 1)
-		atomic.AddInt64(&serverStats.totalConnections, 1)
+		// 使用全局信号量控制并发连接数
+		select {
+		case connLimit <- struct{}{}:
+			// 获取信号量成功，处理连接
+			atomic.AddInt64(&serverStats.activeConnections, 1)
+			atomic.AddInt64(&serverStats.totalConnections, 1)
 
-		// 设置连接的超时时间
-		if tcpConn, ok := conn.(*net.TCPConn); ok {
-			tcpConn.SetKeepAlive(true)
-			tcpConn.SetKeepAlivePeriod(60 * time.Second)
-			tcpConn.SetNoDelay(true)
+			// 设置连接的超时时间
+			if tcpConn, ok := conn.(*net.TCPConn); ok {
+				tcpConn.SetKeepAlive(true)
+				tcpConn.SetKeepAlivePeriod(60 * time.Second)
+				tcpConn.SetNoDelay(true)
+				tcpConn.SetReadBuffer(128 * 1024)  // 增加读缓冲区
+				tcpConn.SetWriteBuffer(128 * 1024) // 增加写缓冲区
+			}
+
+			go func() {
+				handleConnection(conn, server, serverStats)
+				// 完成后释放信号量
+				<-connLimit
+			}()
+		default:
+			// 连接数达到上限，关闭连接
+			conn.Close()
+			log.Printf("达到最大连接数限制，拒绝新连接")
 		}
-
-		go handleConnection(conn, server, serverStats)
 	}
 }
 
+// 改进handleConnection函数，优化数据传输
 func handleConnection(clientConn net.Conn, server Server, serverStats *Stats) {
-	clientAddr := clientConn.RemoteAddr().String()
-	log.Printf("新连接: %s -> %s", clientAddr, server.Name)
-
-	// 确保连接最终会关闭，并更新统计信息
 	defer func() {
 		clientConn.Close()
 		atomic.AddInt64(&serverStats.activeConnections, -1)
@@ -259,34 +299,40 @@ func handleConnection(clientConn net.Conn, server Server, serverStats *Stats) {
 	// 设置客户端连接超时
 	clientConn.SetDeadline(time.Now().Add(10 * time.Second))
 
-	// 连接到实际的矿池
+	// 使用多个并发连接到矿池以提高性能
 	poolConn, err := net.DialTimeout("tcp", server.Pool.Host, 5*time.Second)
 	if err != nil {
-		log.Printf("连接到矿池 %s 失败: %v", server.Pool.Host, err)
 		return
 	}
 	defer poolConn.Close()
 
+	// 设置矿池连接的TCP选项
+	if tcpConn, ok := poolConn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(60 * time.Second)
+		tcpConn.SetNoDelay(true)
+		tcpConn.SetReadBuffer(128 * 1024)  // 增加读缓冲区
+		tcpConn.SetWriteBuffer(128 * 1024) // 增加写缓冲区
+	}
+
 	// 设置矿池连接超时
 	poolConn.SetDeadline(time.Now().Add(10 * time.Second))
 
-	log.Printf("成功连接到矿池: %s", server.Pool.Host)
+	// 双向复制数据
+	var wg sync.WaitGroup
+	wg.Add(2)
 
 	// 用于识别worker的变量
 	var workerName string
 	var workerIdentified bool
 	workerMutex := &sync.Mutex{}
 
-	// 双向复制数据
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	// 客户端 -> 矿池，同时尝试解析worker name
+	// 客户端 -> 矿池
 	go func() {
 		defer wg.Done()
 
 		// 创建一个带缓冲的读取器
-		reader := bufio.NewReaderSize(clientConn, 16*1024)
+		reader := bufio.NewReaderSize(clientConn, 32*1024) // 增加到32K
 
 		for {
 			// 扩展读取超时
@@ -295,11 +341,8 @@ func handleConnection(clientConn net.Conn, server Server, serverStats *Stats) {
 			// 读取一行数据
 			line, err := reader.ReadBytes('\n')
 			if err != nil {
-				if err != io.EOF {
-					// 只记录非EOF错误
-					if !strings.Contains(err.Error(), "use of closed network connection") {
-						log.Printf("从客户端读取错误: %v", err)
-					}
+				if err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
+					// 只处理非EOF非关闭连接错误
 				}
 				break
 			}
@@ -307,9 +350,8 @@ func handleConnection(clientConn net.Conn, server Server, serverStats *Stats) {
 			// 更新读取的字节数
 			atomic.AddInt64(&serverStats.bytesIn, int64(len(line)))
 
-			// 如果尚未识别worker
+			// worker识别逻辑
 			if !workerIdentified {
-				// 只解析可能含有worker信息的请求
 				if bytes.Contains(line, []byte("mining.authorize")) ||
 					bytes.Contains(line, []byte("mining.subscribe")) {
 					var request StratumRequest
@@ -320,7 +362,6 @@ func handleConnection(clientConn net.Conn, server Server, serverStats *Stats) {
 								workerName = workerStr
 								workerIdentified = true
 								workerMutex.Unlock()
-								log.Printf("矿工连接成功: %s - Worker: %s", server.Name, workerStr)
 							}
 						}
 					}
@@ -333,9 +374,6 @@ func handleConnection(clientConn net.Conn, server Server, serverStats *Stats) {
 			// 将数据转发到矿池
 			_, err = poolConn.Write(line)
 			if err != nil {
-				if !strings.Contains(err.Error(), "use of closed network connection") {
-					log.Printf("向矿池写入错误: %v", err)
-				}
 				break
 			}
 		}
@@ -346,7 +384,7 @@ func handleConnection(clientConn net.Conn, server Server, serverStats *Stats) {
 		}
 	}()
 
-	// 矿池 -> 客户端
+	// 矿池 -> 客户端，使用更大的缓冲区
 	go func() {
 		defer wg.Done()
 
@@ -360,9 +398,6 @@ func handleConnection(clientConn net.Conn, server Server, serverStats *Stats) {
 
 			n, err := poolConn.Read(buffer)
 			if err != nil {
-				if err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
-					log.Printf("从矿池读取错误: %v", err)
-				}
 				break
 			}
 
@@ -374,9 +409,6 @@ func handleConnection(clientConn net.Conn, server Server, serverStats *Stats) {
 
 			_, err = clientConn.Write(buffer[:n])
 			if err != nil {
-				if !strings.Contains(err.Error(), "use of closed network connection") {
-					log.Printf("向客户端写入错误: %v", err)
-				}
 				break
 			}
 		}

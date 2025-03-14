@@ -1,4 +1,3 @@
-# 证书, 亦可不提供使用默认的, 自己提供也行
 cert: xx.crt
 key: xx.key
 domain: xxxx.xxx

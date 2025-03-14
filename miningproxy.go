@@ -2,9 +2,15 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -26,6 +32,7 @@ type Config struct {
 	Cert    string   `yaml:"cert"`
 	Key     string   `yaml:"key"`
 	Servers []Server `yaml:"servers"`
+	Domain  string   `yaml:"domain"`
 }
 
 type Server struct {
@@ -86,6 +93,89 @@ var (
 	connLimit = make(chan struct{}, 20000) // 限制最大20000个并发连接
 )
 
+// 添加加密相关的常量
+const (
+	ENCRYPT_NONE = iota
+	ENCRYPT_AES
+	ENCRYPT_XOR
+	ENCRYPT_CUSTOM
+	KEY_SIZE     = 32 // AES-256
+	IV_SIZE      = 16 // AES block size
+	XOR_KEY_SIZE = 16
+	SALT_SIZE    = 16
+)
+
+// 添加加密配置结构体
+type EncryptionConfig struct {
+	Type       int    // 加密类型
+	Key        []byte // 加密密钥
+	IV         []byte // 初始化向量
+	EnableXOR  bool   // 是否启用XOR混淆
+	XORKey     []byte // XOR混淆密钥
+	CustomSalt string // 自定义混淆盐值
+}
+
+// 添加PKCS7填充函数
+func pkcs7Padding(data []byte, blockSize int) []byte {
+	padding := blockSize - len(data)%blockSize
+	padText := bytes.Repeat([]byte{byte(padding)}, padding)
+	return append(data, padText...)
+}
+
+// 添加PKCS7去填充函数
+func pkcs7UnPadding(data []byte) ([]byte, error) {
+	length := len(data)
+	if length == 0 {
+		return nil, errors.New("数据长度为0")
+	}
+
+	padding := int(data[length-1])
+	if padding > length {
+		return nil, errors.New("填充错误")
+	}
+
+	return data[:length-padding], nil
+}
+
+// 生成随机字节序列
+func generateRandomBytes(size int) ([]byte, error) {
+	bytes := make([]byte, size)
+	_, err := rand.Read(bytes)
+	return bytes, err
+}
+
+// 生成新的加密配置
+func newEncryptionConfig() (*EncryptionConfig, error) {
+	key, err := generateRandomBytes(KEY_SIZE)
+	if err != nil {
+		return nil, err
+	}
+
+	iv, err := generateRandomBytes(IV_SIZE)
+	if err != nil {
+		return nil, err
+	}
+
+	xorKey, err := generateRandomBytes(XOR_KEY_SIZE)
+	if err != nil {
+		return nil, err
+	}
+
+	salt, err := generateRandomBytes(SALT_SIZE)
+	if err != nil {
+		return nil, err
+	}
+
+	return &EncryptionConfig{
+		Type:       ENCRYPT_AES,
+		Key:        key,
+		IV:         iv,
+		EnableXOR:  true,
+		XORKey:     xorKey,
+		CustomSalt: base64.StdEncoding.EncodeToString(salt),
+	}, nil
+}
+
 func main() {
 	// 设置GOMAXPROCS为CPU核心数的两倍，充分利用CPU
 	runtime.GOMAXPROCS(runtime.NumCPU() * 2)
@@ -122,15 +212,26 @@ func main() {
 		}
 	}
 
-	// 从证书路径中提取域名
-	domain := extractDomainFromCert(config.Cert)
-	if domain == "" {
-		// 如果无法从证书提取，使用默认域名
-		domain = "pool.boos6.ggff.net"
-	}
+	// 显示矿池信息
+	for _, server := range config.Servers {
+		protocol := "stratum+tcp"
+		if server.IsSSL {
+			protocol = "stratum+ssl"
+		}
 
-	// 首先展示所有矿池信息
-	printPoolInfo(config.Servers, domain)
+		// 使用配置中的domain
+		domain := config.Domain
+		if domain == "" {
+			domain = "baidu.com" // 仅在配置中未指定时使用默认值
+		}
+
+		fmt.Printf("%s %s | 矿池地址 | %s://%s:%d\n",
+			server.Name,
+			server.Pool.Host,
+			protocol,
+			domain,
+			server.Port)
+	}
 
 	// 确保只有一个统计信息打印循环
 	statsTimer := time.NewTimer(10 * time.Second)
@@ -400,7 +501,8 @@ func startServer(server Server, cert tls.Certificate) {
 // 修改 handleConnection 函数，提升 workerName 的可见性
 func handleConnection(clientConn net.Conn, server Server, serverStats *Stats) {
 	var poolConn net.Conn
-	workerName := "未识别" // 默认worker名为未识别
+	workerName := "未识别"
+	workerIdentified := false // 添加标志位
 
 	// 记录客户端连接信息
 	clientAddr := clientConn.RemoteAddr().String()
@@ -421,8 +523,14 @@ func handleConnection(clientConn net.Conn, server Server, serverStats *Stats) {
 		}
 	}()
 
+	// 为每个连接生成新的加密配置
+	encConfig, err := newEncryptionConfig()
+	if err != nil {
+		log.Printf("生成加密配置失败: %v", err)
+		return
+	}
+
 	// 连接到上游矿池
-	var err error
 	poolConn, err = net.Dial("tcp", server.Pool.Host)
 	if err != nil {
 		log.Printf("连接上游矿池失败: %v", err)
@@ -453,11 +561,9 @@ func handleConnection(clientConn net.Conn, server Server, serverStats *Stats) {
 			done <- true
 		}()
 
-		// 移除未使用的buf变量
 		bufReader := bufio.NewReader(clientConn)
 
 		for {
-			// 尝试按行读取（因为很多挖矿协议是基于行的JSON）
 			data, err := bufReader.ReadBytes('\n')
 			if err != nil {
 				if err != io.EOF {
@@ -466,15 +572,24 @@ func handleConnection(clientConn net.Conn, server Server, serverStats *Stats) {
 				break
 			}
 
-			// 尝试解析worker名称
-			newWorker := parseWorkerName(data)
-			if newWorker != "" {
-				workerName = newWorker
-				log.Printf("识别到Worker: %s - %s", workerName, server.Name)
+			// 只在未识别时尝试解析worker名称
+			if !workerIdentified {
+				if newWorker := parseWorkerName(data); newWorker != "" {
+					workerName = newWorker
+					workerIdentified = true
+					log.Printf("识别到Worker: %s - %s", workerName, server.Name)
+				}
+			}
+
+			// 加密数据
+			encrypted, err := encryptData(data, *encConfig)
+			if err != nil {
+				log.Printf("加密数据失败: %v", err)
+				break
 			}
 
 			// 发送数据到矿池
-			clientToPool <- data
+			clientToPool <- encrypted
 		}
 	}()
 
@@ -496,7 +611,15 @@ func handleConnection(clientConn net.Conn, server Server, serverStats *Stats) {
 
 			data := make([]byte, n)
 			copy(data, buf[:n])
-			poolToClient <- data
+
+			// 解密数据
+			decrypted, err := decryptData(data, *encConfig)
+			if err != nil {
+				log.Printf("解密数据失败: %v", err)
+				break
+			}
+
+			poolToClient <- decrypted
 		}
 	}()
 
@@ -590,7 +713,6 @@ func parseWorkerName(data []byte) string {
 		}
 	}
 
-	// 没有识别到worker
 	return ""
 }
 
@@ -648,4 +770,78 @@ func extractDomainFromCert(certPath string) string {
 	}
 
 	return ""
+}
+
+// 修改加密函数以支持随机IV
+func encryptData(data []byte, config EncryptionConfig) ([]byte, error) {
+	if len(data) == 0 {
+		return data, nil
+	}
+
+	// 生成新的随机IV
+	iv, err := generateRandomBytes(IV_SIZE)
+	if err != nil {
+		return nil, err
+	}
+
+	// XOR混淆
+	if config.EnableXOR {
+		for i := 0; i < len(data); i++ {
+			data[i] ^= config.XORKey[i%len(config.XORKey)]
+		}
+	}
+
+	// AES加密
+	block, err := aes.NewCipher(config.Key)
+	if err != nil {
+		return nil, err
+	}
+
+	padded := pkcs7Padding(data, aes.BlockSize)
+	encrypted := make([]byte, len(padded))
+	mode := cipher.NewCBCEncrypter(block, iv)
+	mode.CryptBlocks(encrypted, padded)
+
+	// 将IV添加到加密数据前面
+	result := make([]byte, IV_SIZE+len(encrypted))
+	copy(result, iv)
+	copy(result[IV_SIZE:], encrypted)
+
+	return result, nil
+}
+
+// 修改解密函数以从数据中提取IV
+func decryptData(data []byte, config EncryptionConfig) ([]byte, error) {
+	if len(data) < IV_SIZE {
+		return nil, errors.New("数据长度不足")
+	}
+
+	// 从数据中提取IV
+	iv := data[:IV_SIZE]
+	ciphertext := data[IV_SIZE:]
+
+	// AES解密
+	block, err := aes.NewCipher(config.Key)
+	if err != nil {
+		return nil, err
+	}
+
+	mode := cipher.NewCBCDecrypter(block, iv)
+	decrypted := make([]byte, len(ciphertext))
+	mode.CryptBlocks(decrypted, ciphertext)
+
+	// 去除填充
+	decrypted, err = pkcs7UnPadding(decrypted)
+	if err != nil {
+		return nil, err
+	}
+
+	// XOR反混淆
+	if config.EnableXOR {
+		for i := 0; i < len(decrypted); i++ {
+			decrypted[i] ^= config.XORKey[i%len(config.XORKey)]
+		}
+	}
+
+	return decrypted, nil
 }

@@ -36,12 +36,10 @@ build() {
 # 各平台编译
 build linux amd64 ${BINARY_NAME}_linux_amd64
 build linux arm64 ${BINARY_NAME}_linux_arm64
-build linux arm ${BINARY_NAME}_linux_arm  # 修正: 从 linux/arm/arm 改为 linux/arm
 build windows amd64 ${BINARY_NAME}_windows_amd64.exe
-build windows 386 ${BINARY_NAME}_windows_386.exe
+build windows arm64 ${BINARY_NAME}_windows_arm64.exe
 build darwin amd64 ${BINARY_NAME}_darwin_amd64
 build darwin arm64 ${BINARY_NAME}_darwin_arm64
-build freebsd amd64 ${BINARY_NAME}_freebsd_amd64
 
 echo "=== 编译完成 ==="
 echo "编译结果保存在: $(pwd)/${BUILD_DIR}/"
